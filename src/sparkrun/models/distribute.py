@@ -254,13 +254,17 @@ def distribute_model_from_head(
     if hf_token:
         ensure_script = 'export HF_TOKEN="' + str(quote(hf_token)) + '";\n' + ensure_script
 
-    # Build distribute script (rsync from head to workers)
+    # Build distribute script (rsync from head to workers).  Use
+    # bulk-transfer SSH opts (faster cipher, no compression) — model
+    # files are large and the IB/RoCE fabric is trusted.
+    from sparkrun.orchestration.ssh import _augment_with_bulk_opts
+
     targets = worker_transfer_hosts or hosts[1:]
     model_path = model_cache_path(model_id, cache)
     ssh_opts = build_ssh_opts_string(
         ssh_user=ssh_user,
         ssh_key=ssh_key,
-        ssh_options=ssh_options,
+        ssh_options=_augment_with_bulk_opts(ssh_options),
     )
     dist_script = read_script("model_distribute.sh").format(
         model_path=model_path,

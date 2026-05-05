@@ -18,6 +18,26 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_RSYNC_OPTIONS = ["-az", "--no-times", "--mkpath", "--partial", "--links"]
 
+# Faster SSH options for bulk transfers within a trusted IB/RoCE fabric.
+# AES-128-GCM is roughly 2-3x faster than AES-256-GCM on Grace ARM and
+# matching CPUs; disabling compression avoids redundant work for
+# already-compressed payloads (docker save streams, rsync's own
+# compression).  Only applied to the bulk data path — control plane
+# (running scripts, hash checks, IB detection) keeps OpenSSH defaults.
+_BULK_SSH_OPTS = ["-c", "aes128-gcm@openssh.com", "-o", "Compression=no"]
+
+
+def _augment_with_bulk_opts(ssh_options: list[str] | None) -> list[str]:
+    """Prepend bulk-transfer SSH options to *ssh_options*.
+
+    Caller-supplied options override (later wins in OpenSSH arg parsing),
+    so anyone who really wants AES-256 or compression can still ask for it.
+    """
+    base = list(_BULK_SSH_OPTS)
+    if ssh_options:
+        base.extend(ssh_options)
+    return base
+
 
 @dataclass
 class RemoteResult:
@@ -970,7 +990,7 @@ def run_pipeline_to_remote_with_progress(
         logger.info("[dry-run] Would pump-pipeline to %s: %s | %s", host, " ".join(local_cmd), remote_cmd)
         return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
 
-    ssh_cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
+    ssh_cmd = build_ssh_cmd(host, ssh_user, ssh_key, _augment_with_bulk_opts(ssh_options), connect_timeout)
     ssh_cmd.append(remote_cmd)
 
     logger.info("  Pump-pipeline -> %s%s", host, f" [timeout={timeout}s]" if timeout else "")
@@ -1258,7 +1278,7 @@ def _run_rsync_streaming(
     ssh_opts = build_ssh_opts_string(
         ssh_user=ssh_user,
         ssh_key=ssh_key,
-        ssh_options=ssh_options,
+        ssh_options=_augment_with_bulk_opts(ssh_options),
         connect_timeout=connect_timeout,
     )
     cmd = ["rsync"] + rsync_options + ["-e", f"ssh {ssh_opts}", source, dest]

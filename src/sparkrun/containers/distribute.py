@@ -324,12 +324,16 @@ def distribute_image_from_head(
     # Build ensure script (pull image on head)
     ensure_script = read_script("image_sync.sh").format(image=quote(image))
 
-    # Build distribute script (stream from head to workers)
+    # Build distribute script (stream from head to workers).  Pass the
+    # bulk-transfer SSH opts (faster cipher, no compression) since this
+    # is a docker save→load stream over a trusted IB/RoCE fabric.
+    from sparkrun.orchestration.ssh import _augment_with_bulk_opts
+
     targets = worker_transfer_hosts or hosts[1:]
     ssh_opts = build_ssh_opts_string(
         ssh_user=ssh_user,
         ssh_key=ssh_key,
-        ssh_options=ssh_options,
+        ssh_options=_augment_with_bulk_opts(ssh_options),
     )
     dist_script = read_script("image_distribute.sh").format(
         image=quote(image),

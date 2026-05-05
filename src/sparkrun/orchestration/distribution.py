@@ -41,6 +41,22 @@ class TransferModeResult:
     """True when auto resolved to delegated (enables push fallback)."""
 
 
+def _phase_subject(transfer_mode: str, n_targets: int) -> str:
+    """Human-readable description of which hosts a phase actually transfers to.
+
+    In ``delegated``/``push`` modes the head only *ensures* the resource
+    (no-op if cached) — it isn't a distribution target — so we report
+    only the N-1 workers.  In ``local`` mode the controller transfers
+    to all N hosts directly.  Single-host clusters collapse to
+    "head only".
+    """
+    if n_targets <= 1:
+        return "head only"
+    if transfer_mode in ("delegated", "push"):
+        return "%d worker(s)" % (n_targets - 1)
+    return "%d host(s)" % n_targets
+
+
 def _is_cross_user(ssh_kwargs: dict | None) -> bool:
     """True when *ssh_kwargs* specifies a user different from the OS user."""
     import os
@@ -598,7 +614,7 @@ def distribute_resources(
 
     # Step 3: Distribute model
     if model:
-        logger.log(_PROGRESS_LEVEL, "  Syncing model to %d host(s)", len(host_list))
+        logger.log(_PROGRESS_LEVEL, "  Syncing model %s to %s", model, _phase_subject(transfer_mode, len(host_list)))
         with pending_op(_lock_id, "model_download", **_pop_kw):
             if transfer_mode == "local":
                 mdl_failed = distribute_model_from_local(
@@ -806,7 +822,7 @@ def distribute_from_config(
             targets = _resolve_targets(entry.target if entry.target else [-1], host_list)
             if not targets:
                 continue
-            logger.log(_PROGRESS_LEVEL, "  Distributing image %s to %d host(s)", entry_name, len(targets))
+            logger.log(_PROGRESS_LEVEL, "  Distributing image %s to %s", entry_name, _phase_subject(transfer_mode, len(targets)))
             with pending_op(_lock_id, "image_distribute", **_pop_kw):
                 img_failed = _distribute_single_image(
                     entry_name,
@@ -833,7 +849,7 @@ def distribute_from_config(
             if not targets:
                 continue
             entry_revision = entry.revision or model_revision
-            logger.log(_PROGRESS_LEVEL, "  Distributing model %s to %d host(s)", entry.name, len(targets))
+            logger.log(_PROGRESS_LEVEL, "  Distributing model %s to %s", entry.name, _phase_subject(transfer_mode, len(targets)))
             with pending_op(_lock_id, "model_download", **_pop_kw):
                 mdl_failed = _distribute_single_model(
                     entry.name,

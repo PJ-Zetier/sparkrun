@@ -256,6 +256,24 @@ class TestEndToEndProgressForwarding:
 # ---------------------------------------------------------------------------
 
 
+class TestBulkSshOpts:
+    """Bulk-transfer SSH options (faster cipher, no compression)."""
+
+    def test_augment_with_no_extras(self):
+        from sparkrun.orchestration.ssh import _augment_with_bulk_opts
+
+        opts = _augment_with_bulk_opts(None)
+        assert "aes128-gcm@openssh.com" in opts
+        assert "Compression=no" in opts
+
+    def test_augment_preserves_user_options(self):
+        from sparkrun.orchestration.ssh import _augment_with_bulk_opts
+
+        opts = _augment_with_bulk_opts(["-o", "StrictHostKeyChecking=no"])
+        assert opts[:4] == ["-c", "aes128-gcm@openssh.com", "-o", "Compression=no"]
+        assert "StrictHostKeyChecking=no" in opts
+
+
 class TestAutoEnable:
     def test_disabled_when_stderr_not_tty(self):
         with mock.patch("sparkrun.orchestration.progress_transfer.sys.stderr") as stderr:
