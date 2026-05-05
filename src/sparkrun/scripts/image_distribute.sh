@@ -23,6 +23,12 @@ for TARGET in $TARGETS; do
         DEST="$TARGET"
     fi
     printf "  Sending %s -> %s ...\n" "$IMAGE" "$TARGET"
+    # Emit an initial 0-byte marker so the controller can size the
+    # progress bar immediately — without it, the bar sits at "0 / 0
+    # bytes" during docker save's 30-60s startup latency for large
+    # images and looks like a hang.
+    printf "__SR_PROGRESS host=%s bytes=0 total=%s\n" "$TARGET" "$SIZE" >&2
+    printf "  docker save: preparing image stream (can take 30-60s for large images)...\n"
     # Pipe save -> python byte counter -> ssh load.
     # The byte counter emits __SR_PROGRESS markers on stderr (which
     # the controller reads via merged stdout+stderr).

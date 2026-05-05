@@ -20,6 +20,11 @@ for TARGET in $TARGETS; do
         DEST="$TARGET:$MODEL_PATH/"
     fi
     printf "  Syncing %s -> %s ...\n" "$MODEL_PATH" "$TARGET"
+    # Emit an initial 0-byte marker so the bar renders immediately —
+    # rsync's file-list scan can take 5-30s for large model caches
+    # before it produces the first --info=progress2 line.
+    printf "__SR_PROGRESS host=%s bytes=0\n" "$TARGET" >&2
+    printf "  rsync: scanning files (may take a moment for large caches)...\n"
     # rsync --info=progress2 emits cumulative-bytes lines.  Pipe them
     # through python to convert to __SR_PROGRESS markers tagged with
     # the target host so the controller can route updates.
