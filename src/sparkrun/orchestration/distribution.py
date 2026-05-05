@@ -871,10 +871,14 @@ def _distribute_single_image(
     """Distribute a single image to a subset of hosts."""
     from sparkrun.containers.distribute import distribute_image_from_local, distribute_image_from_head
 
-    # Map transfer hosts to target subset
+    # Map transfer hosts to target subset.  *transfer_hosts* is positionally
+    # aligned with *full_hosts* and *worker_transfer_hosts* with
+    # *full_hosts[1:]* — they may be IB IPs while *targets* are mgmt
+    # hostnames, so the membership test must be against the mgmt host
+    # at the same index, not against the transfer entry itself.
     target_set = set(targets)
-    t_hosts = [h for h in transfer_hosts if h in target_set] if transfer_hosts else None
-    w_hosts = [h for h in worker_transfer_hosts if h in target_set] if worker_transfer_hosts else None
+    t_hosts = [t for h, t in zip(full_hosts, transfer_hosts) if h in target_set] if transfer_hosts else None
+    w_hosts = [t for h, t in zip(full_hosts[1:], worker_transfer_hosts) if h in target_set] if worker_transfer_hosts else None
 
     if transfer_mode == "local":
         return distribute_image_from_local(image, targets, transfer_hosts=t_hosts, dry_run=dry_run, **ssh_kwargs)
@@ -918,9 +922,12 @@ def _distribute_single_model(
     """Distribute a single model to a subset of hosts."""
     from sparkrun.models.distribute import distribute_model_from_local, distribute_model_from_head
 
+    # See _distribute_single_image for the rationale: filter using the
+    # mgmt host at the same index, not the transfer entry (which may be
+    # an IB IP that never appears in target_set).
     target_set = set(targets)
-    t_hosts = [h for h in transfer_hosts if h in target_set] if transfer_hosts else None
-    w_hosts = [h for h in worker_transfer_hosts if h in target_set] if worker_transfer_hosts else None
+    t_hosts = [t for h, t in zip(full_hosts, transfer_hosts) if h in target_set] if transfer_hosts else None
+    w_hosts = [t for h, t in zip(full_hosts[1:], worker_transfer_hosts) if h in target_set] if worker_transfer_hosts else None
 
     if transfer_mode == "local":
         return distribute_model_from_local(

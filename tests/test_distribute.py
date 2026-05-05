@@ -1624,3 +1624,101 @@ class TestDistributeResourcesTransferMode:
         )
         mock_mdl_head.assert_called_once()
         mock_mdl_push.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Regression: _distribute_single_image / _distribute_single_model — IB IP
+# filtering must zip transfer_hosts with full_hosts so the membership test
+# is against mgmt hostnames (which appear in target_set), not against the
+# transfer entry (which may be an IB IP that never matches).  See
+# orchestration/distribution.py.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleImageIBFilter:
+    @mock.patch("sparkrun.containers.distribute.distribute_image_from_head")
+    def test_delegated_passes_ib_ips_for_targeted_workers(self, mock_dist_head):
+        """worker_transfer_hosts (IB IPs) must reach distribute_image_from_head
+        even when targets are mgmt hostnames."""
+        from sparkrun.orchestration.distribution import _distribute_single_image
+
+        mock_dist_head.return_value = []
+        full_hosts = ["spark7", "spark8"]
+        targets = ["spark7", "spark8"]  # mgmt hostnames
+        worker_transfer_hosts = ["10.0.0.8"]  # IB IP for spark8
+
+        _distribute_single_image(
+            "img",
+            targets,
+            full_hosts,
+            transfer_mode="delegated",
+            transfer_hosts=None,
+            worker_transfer_hosts=worker_transfer_hosts,
+            ssh_kwargs={},
+            dry_run=False,
+            auto_delegated=False,
+        )
+
+        # The IB IP (not the mgmt hostname) must propagate as
+        # worker_transfer_hosts to distribute_image_from_head.
+        mock_dist_head.assert_called_once()
+        call_kwargs = mock_dist_head.call_args.kwargs
+        assert call_kwargs["worker_transfer_hosts"] == ["10.0.0.8"]
+
+    @mock.patch("sparkrun.containers.distribute.distribute_image_from_local")
+    def test_local_filters_transfer_hosts_by_mgmt_match(self, mock_dist_local):
+        """transfer_hosts must include only the IB IPs whose mgmt host is in
+        targets (subset case)."""
+        from sparkrun.orchestration.distribution import _distribute_single_image
+
+        mock_dist_local.return_value = []
+        full_hosts = ["spark7", "spark8", "spark9"]
+        targets = ["spark7", "spark9"]  # subset
+        transfer_hosts = ["10.0.0.7", "10.0.0.8", "10.0.0.9"]
+
+        _distribute_single_image(
+            "img",
+            targets,
+            full_hosts,
+            transfer_mode="local",
+            transfer_hosts=transfer_hosts,
+            worker_transfer_hosts=None,
+            ssh_kwargs={},
+            dry_run=False,
+            auto_delegated=False,
+        )
+
+        mock_dist_local.assert_called_once()
+        call_kwargs = mock_dist_local.call_args.kwargs
+        assert call_kwargs["transfer_hosts"] == ["10.0.0.7", "10.0.0.9"]
+
+
+class TestSingleModelIBFilter:
+    @mock.patch("sparkrun.models.distribute.distribute_model_from_head")
+    def test_delegated_passes_ib_ips_for_targeted_workers(self, mock_dist_head):
+        from sparkrun.orchestration.distribution import _distribute_single_model
+
+        mock_dist_head.return_value = []
+        full_hosts = ["spark7", "spark8"]
+        targets = ["spark7", "spark8"]
+        worker_transfer_hosts = ["10.0.0.8"]
+
+        _distribute_single_model(
+            "org/model",
+            targets,
+            full_hosts,
+            cache_dir="/cache",
+            local_cache_dir="/cache",
+            transfer_mode="delegated",
+            transfer_hosts=None,
+            worker_transfer_hosts=worker_transfer_hosts,
+            ssh_kwargs={},
+            revision=None,
+            hf_token=None,
+            dry_run=False,
+            auto_delegated=False,
+        )
+
+        mock_dist_head.assert_called_once()
+        call_kwargs = mock_dist_head.call_args.kwargs
+        assert call_kwargs["worker_transfer_hosts"] == ["10.0.0.8"]
