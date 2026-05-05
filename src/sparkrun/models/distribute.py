@@ -12,10 +12,11 @@ import logging
 from sparkrun.core.config import resolve_hf_cache_home
 from sparkrun.models.download import download_model, model_cache_path
 from sparkrun.orchestration.primitives import map_transfer_failures
+from sparkrun.orchestration.progress_transfer import TransferProgress
 from sparkrun.orchestration.ssh import (
     build_ssh_opts_string,
     run_remote_scripts_parallel,
-    run_rsync_parallel,
+    run_rsync_parallel_with_progress,
 )
 from sparkrun.scripts import read_script
 
@@ -141,19 +142,37 @@ def distribute_model_from_local(
         dry_run=dry_run,
     )
 
-    # Step 3: rsync model cache to all hosts in parallel
+    # Step 3: rsync model cache to all hosts in parallel, with per-host progress bars
     local_model_path = model_cache_path(model_id, local_cache)
     remote_model_path = model_cache_path(model_id, remote_cache)
-    results = run_rsync_parallel(
-        local_model_path,
-        xfer,
-        remote_model_path,
-        ssh_user=ssh_user,
-        ssh_key=ssh_key,
-        ssh_options=ssh_options,
-        timeout=timeout,
-        dry_run=dry_run,
-    )
+
+    with TransferProgress(label="model") as progress:
+        for h in xfer:
+            progress.add_host(h, total=None, action="rsync")
+
+        def _make_cb(h: str):
+            def cb(kind: str, value: int) -> None:
+                if kind == "total":
+                    progress.set_total(h, value)
+                elif kind == "bytes":
+                    progress.set_completed(h, value)
+
+            return cb
+
+        results = run_rsync_parallel_with_progress(
+            local_model_path,
+            xfer,
+            remote_model_path,
+            progress_cb_factory=_make_cb,
+            ssh_user=ssh_user,
+            ssh_key=ssh_key,
+            ssh_options=ssh_options,
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+
+        for r in results:
+            progress.finish(r.host, success=r.success)
 
     # Map transfer IPs back to management hosts for failure reporting
     failed = map_transfer_failures(results, xfer, hosts)
@@ -256,6 +275,9 @@ def distribute_model_from_head(
         ensure_script=ensure_script,
         distribute_script=dist_script,
         resource_label="Model '%s'" % model_id,
+        progress_label="model",
+        progress_action="rsync",
+        worker_progress_hosts=list(targets),
         ssh_user=ssh_user,
         ssh_key=ssh_key,
         ssh_options=ssh_options,

@@ -389,7 +389,7 @@ class TestFilterHostsNeedingImage:
 class TestDistributeImageFromLocal:
     """Test distribute_image_from_local."""
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value=None)
     @mock.patch("sparkrun.containers.distribute.ensure_image")
     def test_dry_run(self, mock_ensure, mock_id, mock_parallel):
@@ -402,7 +402,7 @@ class TestDistributeImageFromLocal:
         failed = distribute_image_from_local("img:latest", ["h1"], dry_run=True)
         assert failed == []
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value=None)
     @mock.patch("sparkrun.containers.distribute.ensure_image")
     def test_success(self, mock_ensure, mock_id, mock_parallel):
@@ -418,10 +418,11 @@ class TestDistributeImageFromLocal:
         # Verify pipeline commands
         mock_parallel.assert_called_once()
         call_kwargs = mock_parallel.call_args
-        assert "docker save img:latest" in call_kwargs[0][1]
+        # Producer is now a list: ["docker", "save", "<image>"]
+        assert call_kwargs[0][1] == ["docker", "save", "img:latest"]
         assert "docker load" in call_kwargs[0][2]
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value=None)
     @mock.patch("sparkrun.containers.distribute.ensure_image")
     def test_ensure_fails(self, mock_ensure, mock_id, mock_parallel):
@@ -433,7 +434,7 @@ class TestDistributeImageFromLocal:
         assert failed == ["h1", "h2"]
         mock_parallel.assert_not_called()
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value=None)
     @mock.patch("sparkrun.containers.distribute.ensure_image")
     def test_partial_failure(self, mock_ensure, mock_id, mock_parallel):
@@ -448,7 +449,7 @@ class TestDistributeImageFromLocal:
         failed = distribute_image_from_local("img:latest", ["h1", "h2"])
         assert failed == ["h2"]
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value=None)
     @mock.patch("sparkrun.containers.distribute.ensure_image")
     def test_empty_hosts(self, mock_ensure, mock_id, mock_parallel):
@@ -459,7 +460,7 @@ class TestDistributeImageFromLocal:
         assert failed == []
         mock_parallel.assert_not_called()
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute._filter_hosts_needing_image")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value="sha256:abc")
     @mock.patch("sparkrun.containers.distribute.ensure_image")
@@ -473,7 +474,7 @@ class TestDistributeImageFromLocal:
         assert failed == []
         mock_parallel.assert_not_called()
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute._filter_hosts_needing_image")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value="sha256:abc")
     @mock.patch("sparkrun.containers.distribute.ensure_image")
@@ -496,7 +497,7 @@ class TestDistributeImageFromLocal:
 class TestDistributeImageTransferHosts:
     """Test transfer_hosts routing in distribute_image_from_local."""
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value=None)
     @mock.patch("sparkrun.containers.distribute.ensure_image")
     def test_transfer_hosts_used_for_pipeline(self, mock_ensure, mock_id, mock_parallel):
@@ -519,7 +520,7 @@ class TestDistributeImageTransferHosts:
         assert "10.0.0.1" in transferred
         assert "10.0.0.2" in transferred
 
-    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel")
+    @mock.patch("sparkrun.containers.distribute.run_pipeline_to_remotes_parallel_with_progress")
     @mock.patch("sparkrun.containers.distribute.get_image_id", return_value=None)
     @mock.patch("sparkrun.containers.distribute.ensure_image")
     def test_transfer_hosts_failure_maps_back(self, mock_ensure, mock_id, mock_parallel):
@@ -558,23 +559,21 @@ class TestDistributeImageFromHead:
         assert failed == []
         assert mock_run.call_count == 1
 
+    @mock.patch("sparkrun.orchestration.ssh.run_remote_script_with_line_callback")
     @mock.patch("sparkrun.orchestration.ssh.run_remote_script")
-    def test_multi_host(self, mock_run):
+    def test_multi_host(self, mock_run, mock_run_lcb):
         """Multi host: pull on head, then distribute script."""
-        mock_run.return_value = RemoteResult(
-            host="head",
-            returncode=0,
-            stdout="ok",
-            stderr="",
-        )
+        ok = RemoteResult(host="head", returncode=0, stdout="ok", stderr="")
+        mock_run.return_value = ok
+        mock_run_lcb.return_value = ok
         from sparkrun.containers.distribute import distribute_image_from_head
 
         failed = distribute_image_from_head("img:latest", ["head", "w1", "w2"])
         assert failed == []
-        # Called twice: once for pull, once for distribute
-        assert mock_run.call_count == 2
-        # Second call should contain the distribution script
-        dist_script = mock_run.call_args_list[1][0][1]
+        # Ensure script runs via run_remote_script; distribute via line-cb variant.
+        assert mock_run.call_count == 1
+        assert mock_run_lcb.call_count == 1
+        dist_script = mock_run_lcb.call_args[0][1]
         assert "w1" in dist_script
         assert "w2" in dist_script
 
@@ -592,13 +591,12 @@ class TestDistributeImageFromHead:
         failed = distribute_image_from_head("img:latest", ["head", "w1"])
         assert failed == ["head", "w1"]
 
+    @mock.patch("sparkrun.orchestration.ssh.run_remote_script_with_line_callback")
     @mock.patch("sparkrun.orchestration.ssh.run_remote_script")
-    def test_distribute_fails(self, mock_run):
+    def test_distribute_fails(self, mock_run, mock_run_lcb):
         """If distribution script fails, target hosts are returned as failed."""
-        mock_run.side_effect = [
-            RemoteResult(host="head", returncode=0, stdout="pulled", stderr=""),
-            RemoteResult(host="head", returncode=1, stdout="", stderr="dist failed"),
-        ]
+        mock_run.return_value = RemoteResult(host="head", returncode=0, stdout="pulled", stderr="")
+        mock_run_lcb.return_value = RemoteResult(host="head", returncode=1, stdout="", stderr="dist failed")
         from sparkrun.containers.distribute import distribute_image_from_head
 
         failed = distribute_image_from_head("img:latest", ["head", "w1", "w2"])
@@ -631,15 +629,13 @@ class TestDistributeImageFromHead:
         assert call_kwargs["ssh_user"] == "admin"
         assert call_kwargs["ssh_key"] == "/mykey"
 
+    @mock.patch("sparkrun.orchestration.ssh.run_remote_script_with_line_callback")
     @mock.patch("sparkrun.orchestration.ssh.run_remote_script")
-    def test_worker_transfer_hosts(self, mock_run):
+    def test_worker_transfer_hosts(self, mock_run, mock_run_lcb):
         """worker_transfer_hosts are used for distribution targets."""
-        mock_run.return_value = RemoteResult(
-            host="head",
-            returncode=0,
-            stdout="ok",
-            stderr="",
-        )
+        ok = RemoteResult(host="head", returncode=0, stdout="ok", stderr="")
+        mock_run.return_value = ok
+        mock_run_lcb.return_value = ok
         from sparkrun.containers.distribute import distribute_image_from_head
 
         failed = distribute_image_from_head(
@@ -649,7 +645,7 @@ class TestDistributeImageFromHead:
         )
         assert failed == []
         # Distribution script should contain IB IPs, not management hosts
-        dist_script = mock_run.call_args_list[1][0][1]
+        dist_script = mock_run_lcb.call_args[0][1]
         assert "10.0.0.1" in dist_script
         assert "10.0.0.2" in dist_script
 
@@ -731,7 +727,7 @@ class TestDistributeImageFromHead:
 class TestDistributeModelFromLocal:
     """Test distribute_model_from_local."""
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_dry_run(self, mock_dl, mock_rsync):
         mock_dl.return_value = 0
@@ -743,7 +739,7 @@ class TestDistributeModelFromLocal:
         failed = distribute_model_from_local("org/model", ["h1"], dry_run=True)
         assert failed == []
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_success(self, mock_dl, mock_rsync):
         mock_dl.return_value = 0
@@ -759,7 +755,7 @@ class TestDistributeModelFromLocal:
         call_args = mock_rsync.call_args[0]
         assert "models--org--model" in call_args[0]
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_download_fails(self, mock_dl, mock_rsync):
         """If download fails, all hosts are returned as failed."""
@@ -770,7 +766,7 @@ class TestDistributeModelFromLocal:
         assert failed == ["h1", "h2"]
         mock_rsync.assert_not_called()
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_partial_failure(self, mock_dl, mock_rsync):
         mock_dl.return_value = 0
@@ -783,7 +779,7 @@ class TestDistributeModelFromLocal:
         failed = distribute_model_from_local("org/model", ["h1", "h2"])
         assert failed == ["h2"]
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_custom_cache_dir(self, mock_dl, mock_rsync):
         mock_dl.return_value = 0
@@ -803,7 +799,7 @@ class TestDistributeModelFromLocal:
         # Rsync path should use custom cache
         assert "/custom/cache/hub/models--org--model" in mock_rsync.call_args[0][0]
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_empty_hosts(self, mock_dl, mock_rsync):
         mock_dl.return_value = 0
@@ -813,7 +809,7 @@ class TestDistributeModelFromLocal:
         assert failed == []
         mock_rsync.assert_not_called()
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_transfer_hosts_used(self, mock_dl, mock_rsync):
         """When transfer_hosts provided, rsync targets use IB IPs."""
@@ -834,7 +830,7 @@ class TestDistributeModelFromLocal:
         rsynced_hosts = mock_rsync.call_args[0][1]
         assert rsynced_hosts == ["10.0.0.1", "10.0.0.2"]
 
-    @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
+    @mock.patch("sparkrun.models.distribute.run_rsync_parallel_with_progress")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_transfer_hosts_failure_maps_back(self, mock_dl, mock_rsync):
         """Failures on transfer IPs are reported as management hostnames."""
@@ -871,22 +867,21 @@ class TestDistributeModelFromHead:
         assert failed == []
         assert mock_run.call_count == 1
 
+    @mock.patch("sparkrun.orchestration.ssh.run_remote_script_with_line_callback")
     @mock.patch("sparkrun.orchestration.ssh.run_remote_script")
-    def test_multi_host(self, mock_run):
+    def test_multi_host(self, mock_run, mock_run_lcb):
         """Multi host: download on head, then distribute script."""
-        mock_run.return_value = RemoteResult(
-            host="head",
-            returncode=0,
-            stdout="ok",
-            stderr="",
-        )
+        ok = RemoteResult(host="head", returncode=0, stdout="ok", stderr="")
+        mock_run.return_value = ok
+        mock_run_lcb.return_value = ok
         from sparkrun.models.distribute import distribute_model_from_head
 
         failed = distribute_model_from_head("org/model", ["head", "w1", "w2"])
         assert failed == []
-        assert mock_run.call_count == 2
-        # Second call should contain the distribution script with targets
-        dist_script = mock_run.call_args_list[1][0][1]
+        # Ensure runs via run_remote_script; distribute via line-cb variant.
+        assert mock_run.call_count == 1
+        assert mock_run_lcb.call_count == 1
+        dist_script = mock_run_lcb.call_args[0][1]
         assert "w1" in dist_script
         assert "w2" in dist_script
         assert "models--org--model" in dist_script
@@ -905,13 +900,12 @@ class TestDistributeModelFromHead:
         failed = distribute_model_from_head("org/model", ["head", "w1"])
         assert failed == ["head", "w1"]
 
+    @mock.patch("sparkrun.orchestration.ssh.run_remote_script_with_line_callback")
     @mock.patch("sparkrun.orchestration.ssh.run_remote_script")
-    def test_distribute_fails(self, mock_run):
+    def test_distribute_fails(self, mock_run, mock_run_lcb):
         """If distribution script fails, target hosts are returned as failed."""
-        mock_run.side_effect = [
-            RemoteResult(host="head", returncode=0, stdout="ok", stderr=""),
-            RemoteResult(host="head", returncode=1, stdout="", stderr="rsync failed"),
-        ]
+        mock_run.return_value = RemoteResult(host="head", returncode=0, stdout="ok", stderr="")
+        mock_run_lcb.return_value = RemoteResult(host="head", returncode=1, stdout="", stderr="rsync failed")
         from sparkrun.models.distribute import distribute_model_from_head
 
         failed = distribute_model_from_head("org/model", ["head", "w1", "w2"])
@@ -923,15 +917,13 @@ class TestDistributeModelFromHead:
         failed = distribute_model_from_head("org/model", [])
         assert failed == []
 
+    @mock.patch("sparkrun.orchestration.ssh.run_remote_script_with_line_callback")
     @mock.patch("sparkrun.orchestration.ssh.run_remote_script")
-    def test_worker_transfer_hosts(self, mock_run):
+    def test_worker_transfer_hosts(self, mock_run, mock_run_lcb):
         """worker_transfer_hosts are used for distribution targets."""
-        mock_run.return_value = RemoteResult(
-            host="head",
-            returncode=0,
-            stdout="ok",
-            stderr="",
-        )
+        ok = RemoteResult(host="head", returncode=0, stdout="ok", stderr="")
+        mock_run.return_value = ok
+        mock_run_lcb.return_value = ok
         from sparkrun.models.distribute import distribute_model_from_head
 
         failed = distribute_model_from_head(
@@ -941,7 +933,7 @@ class TestDistributeModelFromHead:
         )
         assert failed == []
         # Distribution script should contain IB IPs
-        dist_script = mock_run.call_args_list[1][0][1]
+        dist_script = mock_run_lcb.call_args[0][1]
         assert "10.0.0.1" in dist_script
         assert "10.0.0.2" in dist_script
 

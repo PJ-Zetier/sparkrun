@@ -125,6 +125,9 @@ def _distribute_from_head(
     ensure_script: str,
     distribute_script: str,
     resource_label: str,
+    progress_label: str | None = None,
+    progress_action: str = "syncing",
+    worker_progress_hosts: list[str] | None = None,
     ssh_user: str | None = None,
     ssh_key: str | None = None,
     ssh_options: list[str] | None = None,
@@ -137,12 +140,23 @@ def _distribute_from_head(
     2. If single host, return (done).
     3. Run *distribute_script* on head to stream to remaining hosts.
 
+    When *progress_label* is given, the distribute step runs through a
+    line-callback SSH stream and any ``__SR_PROGRESS host=... bytes=...
+    total=...`` markers emitted by the script update a per-worker
+    :class:`TransferProgress` display on the controller.
+
     Args:
         head: Head hostname (``hosts[0]``).
         hosts: Full cluster host list (head + workers).
         ensure_script: Bash script that ensures the resource exists on head.
         distribute_script: Bash script that distributes from head to workers.
         resource_label: Human-readable label for log messages (e.g. "Model", "Image").
+        progress_label: When set (``"image"`` / ``"model"``), enables progress bars
+            driven by ``__SR_PROGRESS`` markers from the head script.
+        progress_action: Sub-label shown next to the host in the progress bar.
+        worker_progress_hosts: Worker host identifiers as they appear in
+            ``__SR_PROGRESS host=...`` markers (typically the IB / transfer
+            IPs the head uses).  Falls back to ``hosts[1:]`` when ``None``.
         ssh_user: Optional SSH username.
         ssh_key: Optional path to SSH private key.
         ssh_options: Additional SSH options.
@@ -152,7 +166,8 @@ def _distribute_from_head(
     Returns:
         List of hostnames where distribution failed (empty = full success).
     """
-    from sparkrun.orchestration.ssh import run_remote_script
+    from sparkrun.orchestration.ssh import run_remote_script, run_remote_script_with_line_callback
+    from sparkrun.orchestration.progress_transfer import TransferProgress, parse_remote_progress_line
 
     # Step 1: ensure resource on head
     ensure_result = run_remote_script(
@@ -173,16 +188,53 @@ def _distribute_from_head(
         logger.info("Single host — %s ready", resource_label)
         return []
 
-    # Step 3: distribute from head to remaining hosts
-    dist_result = run_remote_script(
-        head,
-        distribute_script,
-        ssh_user=ssh_user,
-        ssh_key=ssh_key,
-        ssh_options=ssh_options,
-        timeout=timeout,
-        dry_run=dry_run,
-    )
+    # Step 3: distribute from head to remaining hosts.
+    if progress_label and not dry_run:
+        worker_keys = list(worker_progress_hosts or hosts[1:])
+        registered: set[str] = set()
+        with TransferProgress(label=progress_label) as progress:
+            for h in worker_keys:
+                progress.add_host(h, total=None, action=progress_action)
+                registered.add(h)
+
+            def _line_cb(line: str) -> None:
+                parsed = parse_remote_progress_line(line)
+                if parsed is None:
+                    if line.strip():
+                        logger.debug("[head:%s] %s", head, line)
+                    return
+                marker_host, bytes_done, total = parsed
+                if marker_host not in registered:
+                    # Head used a hostname/IP we didn't pre-register —
+                    # add it on demand so the bar still renders.
+                    progress.add_host(marker_host, total=total, action=progress_action)
+                    registered.add(marker_host)
+                if total is not None:
+                    progress.set_total(marker_host, total)
+                progress.set_completed(marker_host, bytes_done)
+
+            dist_result = run_remote_script_with_line_callback(
+                head,
+                distribute_script,
+                _line_cb,
+                ssh_user=ssh_user,
+                ssh_key=ssh_key,
+                ssh_options=ssh_options,
+                timeout=timeout,
+            )
+
+            for h in registered:
+                progress.finish(h, success=dist_result.success)
+    else:
+        dist_result = run_remote_script(
+            head,
+            distribute_script,
+            ssh_user=ssh_user,
+            ssh_key=ssh_key,
+            ssh_options=ssh_options,
+            timeout=timeout,
+            dry_run=dry_run,
+        )
 
     if dist_result.success:
         from sparkrun.core.progress import PROGRESS

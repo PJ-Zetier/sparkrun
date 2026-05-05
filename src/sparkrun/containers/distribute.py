@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import logging
 
-from sparkrun.containers.registry import ensure_image, get_image_id
+from sparkrun.containers.registry import ensure_image, get_image_id, get_image_size
 from sparkrun.orchestration.primitives import map_transfer_failures
+from sparkrun.orchestration.progress_transfer import TransferProgress
 from sparkrun.orchestration.ssh import (
     RemoteResult,
     build_ssh_opts_string,
-    run_pipeline_to_remotes_parallel,
+    run_pipeline_to_remotes_parallel_with_progress,
     run_remote_command,
 )
 from sparkrun.scripts import read_script
@@ -210,20 +211,33 @@ def distribute_image_from_local(
     if not needs_transfer:
         return []
 
-    # Step 3: stream to hosts that need it
-    local_cmd = "docker save %s" % quote(image)
+    # Step 3: stream to hosts that need it, with per-host progress bars
+    local_cmd_list = ["docker", "save", image]
     remote_cmd = "docker load"
 
-    results = run_pipeline_to_remotes_parallel(
-        needs_transfer,
-        local_cmd,
-        remote_cmd,
-        ssh_user=ssh_user,
-        ssh_key=ssh_key,
-        ssh_options=ssh_options,
-        timeout=timeout,
-        dry_run=dry_run,
-    )
+    image_size = get_image_size(image) if not dry_run else None
+
+    with TransferProgress(label="image") as progress:
+        for h in needs_transfer:
+            progress.add_host(h, total=image_size, action="docker save→load")
+
+        def _make_cb(h: str):
+            return lambda n: progress.advance(h, n)
+
+        results = run_pipeline_to_remotes_parallel_with_progress(
+            needs_transfer,
+            local_cmd_list,
+            remote_cmd,
+            progress_cb_factory=_make_cb,
+            ssh_user=ssh_user,
+            ssh_key=ssh_key,
+            ssh_options=ssh_options,
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+
+        for r in results:
+            progress.finish(r.host, success=r.success)
 
     # Map transfer IPs back to management hosts for failure reporting
     failed = map_transfer_failures(results, xfer, hosts)
@@ -330,6 +344,9 @@ def distribute_image_from_head(
         ensure_script=ensure_script,
         distribute_script=dist_script,
         resource_label="Image '%s'" % image,
+        progress_label="image",
+        progress_action="docker save→load",
+        worker_progress_hosts=list(targets),
         ssh_user=ssh_user,
         ssh_key=ssh_key,
         ssh_options=ssh_options,

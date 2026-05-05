@@ -70,6 +70,27 @@ def get_image_id(image: str) -> str | None:
     return result.stdout.strip()
 
 
+def get_image_size(image: str) -> int | None:
+    """Get the on-disk size of a local image in bytes.
+
+    Used to size progress bars during image distribution.  Returns
+    ``None`` when the image isn't present locally or the size can't
+    be parsed.
+    """
+    result = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Size}}", image],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def ensure_image(image: str, dry_run: bool = False) -> int:
     """Ensure an image exists locally, pulling if needed.
 

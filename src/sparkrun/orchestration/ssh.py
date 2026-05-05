@@ -276,6 +276,96 @@ def run_remote_script_streaming(
         return RemoteResult(host=host, returncode=-1, stdout="", stderr=str(e))
 
 
+def run_remote_script_with_line_callback(
+    host: str,
+    script: str,
+    line_cb,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    connect_timeout: int = 10,
+    timeout: int | None = None,
+    dry_run: bool = False,
+) -> RemoteResult:
+    """Execute a script on a remote host and invoke *line_cb* per output line.
+
+    The script's stdout and stderr are merged and read line-by-line
+    so a controller can react to progress markers in real time
+    (used by from-head distribution).  Lines that ``line_cb``
+    consumes are still appended to :attr:`RemoteResult.stdout`.
+
+    Args:
+        host: Remote hostname or IP.
+        script: Bash script content to execute.
+        line_cb: Callable invoked as ``cb(line)`` for each output
+            line (no trailing newline).  Errors in the callback are
+            swallowed so they can't disrupt the SSH stream.
+        ssh_user, ssh_key, ssh_options, connect_timeout, timeout, dry_run:
+            See :func:`run_remote_script`.
+    """
+    if dry_run:
+        logger.info("[dry-run] Would execute (line-cb) on %s (%d bytes)", host, len(script))
+        return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
+
+    cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
+    cmd.extend(["bash", "-s"])
+
+    logger.debug("  SSH script (line-cb) -> %s (%d bytes)", host, len(script))
+
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merge so we get progress markers in order
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        logger.error("  SSH script (line-cb) <- %s ERROR (%.1fs): %s", host, elapsed, e)
+        return RemoteResult(host=host, returncode=-1, stdout="", stderr=str(e))
+
+    assert proc.stdin is not None and proc.stdout is not None
+    try:
+        proc.stdin.write(script)
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    captured: list[str] = []
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            captured.append(line)
+            try:
+                line_cb(line)
+            except Exception:  # pragma: no cover - defensive
+                pass
+    except Exception as e:
+        logger.error("  SSH script (line-cb) <- %s read error: %s", host, e)
+
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - t0
+        logger.error("  SSH script (line-cb) <- %s TIMEOUT after %.0fs", host, elapsed)
+        proc.kill()
+        return RemoteResult(host=host, returncode=-1, stdout="\n".join(captured), stderr="Execution timed out")
+
+    elapsed = time.monotonic() - t0
+    if rc == 0:
+        logger.debug("  SSH script (line-cb) <- %s OK (%.1fs)", host, elapsed)
+    else:
+        logger.warning("  SSH script (line-cb) <- %s FAILED rc=%d (%.1fs)", host, rc, elapsed)
+    return RemoteResult(host=host, returncode=rc, stdout="\n".join(captured), stderr="")
+
+
 def run_remote_command(
     host: str,
     command: str,
@@ -838,6 +928,143 @@ def run_rsync(
     )
 
 
+def run_pipeline_to_remote_with_progress(
+    host: str,
+    local_cmd: list[str],
+    remote_cmd: str,
+    progress_cb=None,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    connect_timeout: int = 10,
+    timeout: int | None = None,
+    chunk_size: int = 1024 * 1024,
+    dry_run: bool = False,
+) -> RemoteResult:
+    """Stream a local producer's stdout into a remote consumer with byte tracking.
+
+    Like :func:`run_pipeline_to_remote` but the byte stream goes
+    through Python so a *progress_cb(n_bytes)* can be invoked per
+    chunk read.  Used for ``docker save | ssh ... docker load``
+    when we need a progress bar.
+
+    Args:
+        host: Remote hostname or IP.
+        local_cmd: Local producer as a list (e.g. ``["docker", "save", image]``).
+        remote_cmd: Command to run on the remote host (consumer side).
+        progress_cb: Callable invoked with the size of each chunk
+            written to the remote.  Errors in the callback are
+            swallowed so they can't break the transfer.
+        ssh_user: Optional SSH username.
+        ssh_key: Optional path to SSH private key.
+        ssh_options: Additional SSH options.
+        connect_timeout: SSH connection timeout in seconds.
+        timeout: Overall execution timeout in seconds.
+        chunk_size: Read/write chunk size in bytes.
+        dry_run: If True, log the plan but don't execute.
+
+    Returns:
+        RemoteResult with returncode, stdout, stderr.
+    """
+    if dry_run:
+        logger.info("[dry-run] Would pump-pipeline to %s: %s | %s", host, " ".join(local_cmd), remote_cmd)
+        return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
+
+    ssh_cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
+    ssh_cmd.append(remote_cmd)
+
+    logger.info("  Pump-pipeline -> %s%s", host, f" [timeout={timeout}s]" if timeout else "")
+    logger.debug("Producer: %s", " ".join(local_cmd))
+    logger.debug("SSH consumer: %s", " ".join(ssh_cmd))
+
+    t0 = time.monotonic()
+    producer = None
+    consumer = None
+    stderr_chunks: list[str] = []
+
+    try:
+        producer = subprocess.Popen(
+            local_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        consumer = subprocess.Popen(
+            ssh_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        assert producer.stdout is not None and consumer.stdin is not None
+        try:
+            while True:
+                chunk = producer.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                consumer.stdin.write(chunk)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(len(chunk))
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+        finally:
+            try:
+                consumer.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        prod_rc = producer.wait(timeout=timeout)
+        cons_rc = consumer.wait(timeout=timeout)
+
+        cons_stdout = consumer.stdout.read().decode(errors="replace") if consumer.stdout else ""
+        cons_stderr = consumer.stderr.read().decode(errors="replace") if consumer.stderr else ""
+        prod_stderr = producer.stderr.read().decode(errors="replace") if producer.stderr else ""
+        if prod_stderr:
+            stderr_chunks.append(prod_stderr)
+        if cons_stderr:
+            stderr_chunks.append(cons_stderr)
+
+        elapsed = time.monotonic() - t0
+        rc = prod_rc if prod_rc != 0 else cons_rc
+        if rc == 0:
+            logger.info("  Pump-pipeline <- %s OK (%.1fs)", host, elapsed)
+        else:
+            logger.warning(
+                "  Pump-pipeline <- %s FAILED prod_rc=%d cons_rc=%d (%.1fs): %s",
+                host,
+                prod_rc,
+                cons_rc,
+                elapsed,
+                "".join(stderr_chunks).strip()[:200],
+            )
+        return RemoteResult(
+            host=host,
+            returncode=rc,
+            stdout=cons_stdout,
+            stderr="".join(stderr_chunks),
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - t0
+        logger.error("  Pump-pipeline <- %s TIMEOUT after %.0fs", host, elapsed)
+        for proc in (producer, consumer):
+            if proc is not None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        return RemoteResult(host=host, returncode=-1, stdout="", stderr="Execution timed out")
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        logger.error("  Pump-pipeline <- %s ERROR (%.1fs): %s", host, elapsed, e)
+        for proc in (producer, consumer):
+            if proc is not None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        return RemoteResult(host=host, returncode=-1, stdout="", stderr=str(e))
+
+
 def run_pipeline_to_remotes_parallel(
     hosts: list[str],
     local_cmd: str,
@@ -899,6 +1126,65 @@ def run_pipeline_to_remotes_parallel(
     return results
 
 
+def run_pipeline_to_remotes_parallel_with_progress(
+    hosts: list[str],
+    local_cmd: list[str],
+    remote_cmd: str,
+    progress_cb_factory=None,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    connect_timeout: int = 10,
+    timeout: int | None = None,
+    chunk_size: int = 1024 * 1024,
+    dry_run: bool = False,
+) -> list[RemoteResult]:
+    """Pump-pipeline variant of :func:`run_pipeline_to_remotes_parallel`.
+
+    For each host, a fresh producer subprocess (``local_cmd``) is
+    started and its stdout is streamed to ``ssh <host> <remote_cmd>``.
+    *progress_cb_factory(host)* (when given) returns a per-host
+    callback ``cb(n_bytes)`` invoked for each chunk written to that
+    host's SSH consumer.
+
+    The producer is *not* shared between hosts — Docker's ``docker save``
+    is fast and pumping it twice is simpler than fanning out a single
+    stream, especially since the pipe order matters for progress
+    accuracy.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    logger.info("  Running pump-pipeline in parallel to %d hosts: %s", len(hosts), ", ".join(hosts))
+
+    t0 = time.monotonic()
+    results: list[RemoteResult] = []
+    with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
+        futures = {
+            executor.submit(
+                run_pipeline_to_remote_with_progress,
+                host,
+                local_cmd,
+                remote_cmd,
+                progress_cb=progress_cb_factory(host) if progress_cb_factory else None,
+                ssh_user=ssh_user,
+                ssh_key=ssh_key,
+                ssh_options=ssh_options,
+                connect_timeout=connect_timeout,
+                timeout=timeout,
+                chunk_size=chunk_size,
+                dry_run=dry_run,
+            ): host
+            for host in hosts
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    elapsed = time.monotonic() - t0
+    ok = sum(1 for r in results if r.success)
+    logger.info("  Parallel pump-pipeline done: %d/%d OK (%.1fs total)", ok, len(results), elapsed)
+    return results
+
+
 def run_rsync_from_remote(
     host: str,
     source_path: str,
@@ -931,6 +1217,210 @@ def run_rsync_from_remote(
         timeout=timeout,
         dry_run=dry_run,
     )
+
+
+def _run_rsync_streaming(
+    source: str,
+    dest: str,
+    host: str,
+    direction: str,
+    progress_cb=None,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    connect_timeout: int = 10,
+    rsync_options: list[str] | None = None,
+    timeout: int | None = None,
+    dry_run: bool = False,
+) -> RemoteResult:
+    """Run rsync with ``--info=progress2`` and forward progress lines.
+
+    Lines parseable as ``"<bytes> <pct>%"`` are converted to two
+    callback signals:
+
+    - ``progress_cb("total", N)``  — declared total (only the first line)
+    - ``progress_cb("bytes", N)``  — current cumulative bytes
+
+    Other rsync output is captured and returned in
+    :attr:`RemoteResult.stdout`.
+    """
+    from sparkrun.orchestration.progress_transfer import parse_rsync_progress_line
+
+    if rsync_options is None:
+        rsync_options = list(_DEFAULT_RSYNC_OPTIONS)
+
+    # Augment with progress-emitting flags (idempotent if already present).
+    extra = ["--info=progress2", "--no-inc-recursive"]
+    for opt in extra:
+        if opt not in rsync_options:
+            rsync_options = rsync_options + [opt]
+
+    ssh_opts = build_ssh_opts_string(
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        ssh_options=ssh_options,
+        connect_timeout=connect_timeout,
+    )
+    cmd = ["rsync"] + rsync_options + ["-e", f"ssh {ssh_opts}", source, dest]
+
+    if dry_run:
+        logger.info("[dry-run] Would rsync %s %s: %s", direction, host, " ".join(cmd))
+        return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
+
+    logger.info("  Rsync (progress) %s %s%s", direction, host, f" [timeout={timeout}s]" if timeout else "")
+    logger.debug("Rsync command: %s", " ".join(cmd))
+
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        logger.error("  Rsync %s %s ERROR (%.1fs): %s", direction, host, elapsed, e)
+        return RemoteResult(host=host, returncode=-1, stdout="", stderr=str(e))
+
+    captured: list[str] = []
+    last_bytes = 0
+    total_seen = False
+    assert proc.stdout is not None
+    try:
+        # rsync emits progress on stdout when --info=progress2 is set;
+        # filenames and a final summary appear there too.  Iterating
+        # in unbuffered/line-buffered mode keeps callback latency low.
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            captured.append(line)
+            parsed = parse_rsync_progress_line(line)
+            if parsed is None:
+                continue
+            cur_bytes, pct = parsed
+            if progress_cb is not None:
+                # rsync emits progress as cumulative bytes, but the
+                # *total* needs to be inferred from cumulative ÷ pct.
+                if not total_seen and pct > 0:
+                    total = int(cur_bytes * 100 / pct) if pct > 0 else 0
+                    if total > 0:
+                        try:
+                            progress_cb("total", total)
+                            total_seen = True
+                        except Exception:  # pragma: no cover - defensive
+                            pass
+                try:
+                    progress_cb("bytes", cur_bytes)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            last_bytes = cur_bytes
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        logger.error("  Rsync %s %s read error (%.1fs): %s", direction, host, elapsed, e)
+
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - t0
+        logger.error("  Rsync %s %s TIMEOUT after %.0fs", direction, host, elapsed)
+        proc.kill()
+        return RemoteResult(host=host, returncode=-1, stdout="", stderr="Execution timed out")
+
+    err = proc.stderr.read() if proc.stderr else ""
+    elapsed = time.monotonic() - t0
+    if rc == 0:
+        logger.info("  Rsync %s %s OK (%.1fs, %d bytes)", direction, host, elapsed, last_bytes)
+    else:
+        logger.warning(
+            "  Rsync %s %s FAILED rc=%d (%.1fs): %s",
+            direction,
+            host,
+            rc,
+            elapsed,
+            err.strip()[:200],
+        )
+
+    return RemoteResult(host=host, returncode=rc, stdout="\n".join(captured), stderr=err)
+
+
+def run_rsync_with_progress(
+    source_path: str,
+    host: str,
+    dest_path: str,
+    progress_cb=None,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    connect_timeout: int = 10,
+    rsync_options: list[str] | None = None,
+    timeout: int | None = None,
+    dry_run: bool = False,
+) -> RemoteResult:
+    """Like :func:`run_rsync` but parses ``--info=progress2`` for callbacks."""
+    src = source_path.rstrip("/") + "/"
+    target = f"{ssh_user}@{host}:{dest_path}" if ssh_user else f"{host}:{dest_path}"
+    return _run_rsync_streaming(
+        src,
+        target,
+        host,
+        "->",
+        progress_cb=progress_cb,
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        ssh_options=ssh_options,
+        connect_timeout=connect_timeout,
+        rsync_options=rsync_options,
+        timeout=timeout,
+        dry_run=dry_run,
+    )
+
+
+def run_rsync_parallel_with_progress(
+    source_path: str,
+    hosts: list[str],
+    dest_path: str,
+    progress_cb_factory=None,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    connect_timeout: int = 10,
+    rsync_options: list[str] | None = None,
+    timeout: int | None = None,
+    dry_run: bool = False,
+) -> list[RemoteResult]:
+    """Parallel rsync to multiple hosts with per-host progress callbacks."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    logger.info("  Running rsync (progress) in parallel to %d hosts: %s", len(hosts), ", ".join(hosts))
+
+    t0 = time.monotonic()
+    results: list[RemoteResult] = []
+    with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
+        futures = {
+            executor.submit(
+                run_rsync_with_progress,
+                source_path,
+                host,
+                dest_path,
+                progress_cb=progress_cb_factory(host) if progress_cb_factory else None,
+                ssh_user=ssh_user,
+                ssh_key=ssh_key,
+                ssh_options=ssh_options,
+                connect_timeout=connect_timeout,
+                rsync_options=rsync_options,
+                timeout=timeout,
+                dry_run=dry_run,
+            ): host
+            for host in hosts
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    elapsed = time.monotonic() - t0
+    ok = sum(1 for r in results if r.success)
+    logger.info("  Parallel rsync (progress) done: %d/%d OK (%.1fs total)", ok, len(results), elapsed)
+    return results
 
 
 def run_rsync_parallel(
