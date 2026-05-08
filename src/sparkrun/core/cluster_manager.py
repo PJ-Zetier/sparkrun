@@ -630,11 +630,42 @@ def resolve_cluster_config(
     """
     cfg = ResolvedClusterConfig()
 
-    # Determine which cluster to resolve
+    # Determine which cluster to resolve.
+    #
+    # If --cluster is explicit, use it. Otherwise we still want the default
+    # cluster's SSH user even when the operator passed --hosts/--hosts-file,
+    # because remote paths like ``$HOME/.cache/huggingface`` are resolved on
+    # the controller side and need the cluster's user, not the operator's.
+    # Without this fallback, a command like
+    #     sparkrun run RECIPE -H spark2
+    # picks up the operator's local $HOME (e.g. /home/pj.reid) and tries to
+    # write there on the remote, failing with EACCES.
+    #
+    # Only the user/name is borrowed from the default cluster in this fallback
+    # path. transfer_mode/cache_dir/topology stay unset because those describe
+    # the full cluster shape and don't necessarily apply to an arbitrary
+    # --hosts subset.
     resolved = cluster_name
-    if not resolved and not hosts and not hosts_file:
-        resolved = cluster_mgr.get_default() if cluster_mgr else None
-        logger.debug("No cluster given, trying (default)  cluster '%s'", resolved)
+    explicit_hosts = bool(hosts or hosts_file)
+    if not resolved:
+        default_name = cluster_mgr.get_default() if cluster_mgr else None
+        if not explicit_hosts:
+            resolved = default_name
+            logger.debug("No cluster given, trying (default) cluster '%s'", resolved)
+        elif default_name:
+            # Explicit --hosts without --cluster: borrow user from the default
+            # cluster so $HOME-relative paths resolve on the remote correctly.
+            try:
+                cluster_def = cluster_mgr.get(default_name)
+                cfg.user = cluster_def.user
+                logger.debug(
+                    "Explicit --hosts without --cluster; borrowing SSH user '%s' from default cluster '%s'",
+                    cfg.user,
+                    default_name,
+                )
+            except Exception:
+                logger.debug("Default cluster '%s' lookup failed during user-only fallback", default_name, exc_info=True)
+            return cfg
     else:
         logger.debug("Cluster resolution: %s", resolved)
 
@@ -653,7 +684,7 @@ def resolve_cluster_config(
     cfg.user = cluster_def.user
 
     # transfer_mode, transfer_interface, cache_dir, and topology only apply when hosts come from the cluster
-    if not hosts and not hosts_file:
+    if not explicit_hosts:
         logger.debug("Using cluster config for transfer_mode, transfer_interface, cache_dir, and topology")
         cfg.transfer_mode = cluster_def.transfer_mode
         cfg.transfer_interface = cluster_def.transfer_interface

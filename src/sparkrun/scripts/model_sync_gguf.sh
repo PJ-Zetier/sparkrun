@@ -1,7 +1,9 @@
 #!/bin/bash
 set -uo pipefail
 echo "Checking GGUF model cache for {repo_id} (quant: {quant})..."
-SAFE_NAME=$(echo "{repo_id}" | tr '/' '--')
+# HuggingFace cache uses DOUBLE dashes between org and repo. `tr '/' '--'`
+# silently emits a single dash; use sed for the multi-char replacement.
+SAFE_NAME=$(echo "{repo_id}" | sed 's|/|--|g')
 CACHE_PATH="{cache}/hub/models--$SAFE_NAME"
 
 # Check if GGUF file matching quant already exists
@@ -14,7 +16,10 @@ if [ -d "$CACHE_PATH/snapshots" ]; then
 fi
 
 echo "Downloading GGUF model: {repo_id} (quant: {quant})..."
-if command -v huggingface-cli &>/dev/null; then
+# Priority: `hf` > deprecated `huggingface-cli` > uvx-installed `hf`.
+if command -v hf &>/dev/null; then
+    hf download "{repo_id}" --include "*{quant}*" {revision_flag}--cache-dir "{cache}/hub"
+elif command -v huggingface-cli &>/dev/null; then
     huggingface-cli download "{repo_id}" --include "*{quant}*" {revision_flag}--cache-dir "{cache}/hub"
 elif command -v uvx &>/dev/null; then
     uvx hf download "{repo_id}" --include "*{quant}*" {revision_flag}--cache-dir "{cache}/hub"

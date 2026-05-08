@@ -184,6 +184,7 @@ def _distribute_from_head(
     """
     from sparkrun.orchestration.ssh import run_remote_script, run_remote_script_with_line_callback
     from sparkrun.orchestration.progress_transfer import TransferProgress, parse_remote_progress_line
+    from sparkrun.core.progress import PROGRESS as _PROGRESS_LEVEL
 
     # Step 1: ensure resource on head
     ensure_result = run_remote_script(
@@ -198,6 +199,14 @@ def _distribute_from_head(
     if not ensure_result.success:
         logger.error("Failed to ensure %s on head %s", resource_label, head)
         return list(hosts)
+    # Surface a clear message when the head already has the resource so
+    # operators don't mistake the immediate skip-to-distribute for a stuck
+    # download. model_sync.sh and model_sync_gguf.sh both print
+    # "Model already cached: <id>" on the cache-hit path; the image-pull
+    # equivalent uses "up to date".
+    out = ensure_result.stdout or ""
+    if "already cached" in out or "up to date" in out.lower():
+        logger.log(_PROGRESS_LEVEL, "  %s already on head %s — skipping head download", resource_label, head)
 
     # Step 2: if single host, we're done
     if len(hosts) == 1:

@@ -16,7 +16,17 @@ from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_RSYNC_OPTIONS = ["-az", "--no-times", "--mkpath", "--partial", "--links"]
+# NOTE: do NOT add `-z` here. rsync's zlib compression is single-threaded
+# and CPU-bound on ARM (Grace/GB10), capping bulk transfers at ~2-3 Gb/s
+# even on a 100+ Gb/s fabric. HF model files (safetensors, gguf) and docker
+# save streams are already incompressible, so `-z` is pure overhead.
+#
+# NOTE: do NOT add `--no-times` here. Without preserved mtimes, every
+# subsequent sync forces rsync's full delta-transfer rolling-checksum
+# algorithm — both ends re-read every byte of the cache to discover that
+# nothing changed. With `-a`'s built-in `-t` mtime preservation, rsync's
+# quick-check (size+mtime) skips already-synced files in milliseconds.
+_DEFAULT_RSYNC_OPTIONS = ["-a", "--mkpath", "--partial", "--links"]
 
 # Faster SSH options for bulk transfers within a trusted IB/RoCE fabric.
 # AES-128-GCM is roughly 2-3x faster than AES-256-GCM on Grace ARM and

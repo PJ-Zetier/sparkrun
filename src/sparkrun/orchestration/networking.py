@@ -1675,20 +1675,22 @@ def distribute_host_keys(
         return []
 
     ip_list = " ".join(ips)
+    # Single ssh-keyscan invocation with all IPs: ssh-keyscan parallelizes
+    # internally (default MAX_FORKS=32). `-T 2` caps per-host wait at 2 s, so
+    # IPs that aren't routable from the caller (e.g. CX7 fabric IPs scanned
+    # from an off-fabric operator workstation) fail fast instead of stalling
+    # the loop.
     script = (
         "#!/bin/bash\n"
         "set -uo pipefail\n"
         "mkdir -p ~/.ssh\n"
         "touch ~/.ssh/known_hosts\n"
-        "ADDED=0\n"
-        "for ip in %s; do\n"
-        '    keys=$(ssh-keyscan -H "$ip" 2>/dev/null)\n'
-        '    if [ -n "$keys" ]; then\n'
-        '        printf "%%s\\n" "$keys" >> ~/.ssh/known_hosts\n'
-        "        ADDED=$((ADDED + 1))\n"
-        "    fi\n"
-        "done\n"
+        "keys=$(ssh-keyscan -T 2 -H %s 2>/dev/null || true)\n"
+        'if [ -n "$keys" ]; then\n'
+        '    printf "%%s\\n" "$keys" >> ~/.ssh/known_hosts\n'
+        "fi\n"
         "sort -u ~/.ssh/known_hosts -o ~/.ssh/known_hosts\n"
+        'ADDED=$(printf "%%s" "$keys" | awk \'NF && $1 !~ /^#/ { print $1 }\' | sort -u | wc -l)\n'
         'echo "KEYSCAN_ADDED=$ADDED"\n'
     ) % ip_list
 
